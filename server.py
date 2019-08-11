@@ -7,9 +7,41 @@ import util
 SOCKET_DEST = {}
 SOCKET_ADDRESS = {}
 
-KQUEUE = select.kqueue()
+# Dumb enum for event types
+READ, WRITE, ERROR = range(3)
 
-READ_FLAGS = select.KQ_FILTER_READ# | select.KQ_FILTER_EXCEPT
+# kqueue interface for BSD
+if hasattr(select, 'kqueue'):
+    READ_FLAGS = select.KQ_FILTER_READ# | select.KQ_FILTER_EXCEPT
+
+    class EventQueue:
+        def __init__(self):
+            self.kqueue = select.kqueue()
+        def register(self, fd):
+            event = select.kevent(fd, READ_FLAGS, select.KQ_EV_ADD)
+            self.kqueue.control([event], 0)
+        def unregister(self, fd):
+            event = select.kevent(fd, READ_FLAGS, select.KQ_EV_DELETE)
+            self.kqueue.control([event], 0)
+        def wait(self):
+            events = self.kqueue.control(None, 1)
+            if not events:
+                return None
+            assert len(events) == 1
+            event = events[0]
+
+            if event.flags & (select.KQ_EV_ERROR | select.KQ_EV_EOF):
+                event_type = ERROR
+            # No write for now, we don't listen for writeability now
+            else:
+                event_type = READ
+
+            return event.ident, event_type
+
+else:
+    assert False, 'need kqueue support for event loop'
+
+event_queue = EventQueue()
 
 def listen(host, port):
     global LISTEN_SOCK
@@ -17,19 +49,16 @@ def listen(host, port):
     LISTEN_SOCK.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
     LISTEN_SOCK.bind((host, port))
     LISTEN_SOCK.listen()
-    event = select.kevent(LISTEN_SOCK, READ_FLAGS, select.KQ_EV_ADD)
-    KQUEUE.control([event], 0)
+
+    event_queue.register(LISTEN_SOCK)
 
 def connect_one(src, dest):
     SOCKET_DEST[src.fileno()] = (src, dest)
-    # XXX oneshot
-    event = select.kevent(src, READ_FLAGS, select.KQ_EV_ADD)
-    KQUEUE.control([event], 0)
+    event_queue.register(src)
 
 def disconnect_one(src, dest):
     del SOCKET_DEST[src.fileno()]
-    event = select.kevent(src, READ_FLAGS, select.KQ_EV_DELETE)
-    KQUEUE.control([event], 0)
+    event_queue.unregister(src)
 
 def connect(src, src_address, dest, dest_address):
     logging.info('Connecting %s to %s', src_address, dest_address)
@@ -69,14 +98,12 @@ def accept():
 
 def run_event_loop():
     while True:
-        events = KQUEUE.control(None, 1)
-        if not events:
+        event = event_queue.wait()
+        if not event:
             logging.error('No events, exiting.')
             break
-        assert len(events) == 1
-        event = events[0]
+        src_fd, event_type = event
 
-        src_fd = event.ident
 
         # New connection available, accept it
         if src_fd == LISTEN_SOCK.fileno():
@@ -87,7 +114,7 @@ def run_event_loop():
             src, dest = SOCKET_DEST[src_fd]
 
             # Error, disconnect
-            if event.flags & (select.KQ_EV_ERROR | select.KQ_EV_EOF):
+            if event_type == ERROR:
                 disconnect(src, dest)
             else:
                 buf = util.recv(src, 1024)
